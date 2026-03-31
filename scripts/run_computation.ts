@@ -53,6 +53,36 @@ async function withRpcRetry<T>(fn: () => Promise<T>, retries = 8): Promise<T> {
   }
 }
 
+async function confirmSignatureByPolling(
+  connection: anchor.web3.Connection,
+  signature: string,
+  lastValidBlockHeight: number,
+  commitment: anchor.web3.Commitment,
+): Promise<void> {
+  for (;;) {
+    const [{ value: status }, currentBlockHeight] = await Promise.all([
+      withRpcRetry(() => connection.getSignatureStatuses([signature])),
+      withRpcRetry(() => connection.getBlockHeight(commitment)),
+    ]);
+
+    const sigStatus = status[0];
+    if (sigStatus?.err) {
+      throw new Error(`Signature ${signature} failed: ${JSON.stringify(sigStatus.err)}`);
+    }
+    if (
+      sigStatus &&
+      (sigStatus.confirmationStatus === "confirmed" ||
+        sigStatus.confirmationStatus === "finalized")
+    ) {
+      return;
+    }
+    if (currentBlockHeight > lastValidBlockHeight) {
+      throw new Error(`Signature ${signature} has expired: block height exceeded.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+}
+
 async function sendAndConfirmCompat(
   provider: anchor.AnchorProvider,
   tx: anchor.web3.Transaction,
@@ -82,12 +112,10 @@ async function sendAndConfirmCompat(
   );
 
   await withRpcRetry(() =>
-    provider.connection.confirmTransaction(
-      {
-        signature: sig,
-        blockhash: tx.recentBlockhash,
-        lastValidBlockHeight: tx.lastValidBlockHeight!,
-      },
+    confirmSignatureByPolling(
+      provider.connection,
+      sig,
+      tx.lastValidBlockHeight!,
       commitment,
     ),
   );
@@ -99,6 +127,15 @@ function readKp(p: string): Keypair {
   return Keypair.fromSecretKey(
     new Uint8Array(JSON.parse(fs.readFileSync(p).toString()))
   );
+}
+
+function makeConnection(): anchor.web3.Connection {
+  const httpRpcUrl = process.env.ANCHOR_PROVIDER_URL || process.env.RPC_URL || "https://api.devnet.solana.com";
+  const wsRpcUrl = process.env.WS_RPC_URL;
+  return new anchor.web3.Connection(httpRpcUrl, {
+    commitment: "confirmed",
+    wsEndpoint: wsRpcUrl,
+  });
 }
 
 const WALLETS = [
@@ -121,9 +158,7 @@ async function runMatchOrderComputation(walletPath: string, clusterOffset: numbe
   const walletName = path.basename(walletPath, ".json");
   try {
     const owner = readKp(walletPath);
-    const conn = new anchor.web3.Connection(
-      process.env.RPC_URL || "https://api.devnet.solana.com", "confirmed"
-    );
+    const conn = makeConnection();
     const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(owner), {
       commitment: "confirmed", skipPreflight: true,
     });
@@ -216,10 +251,7 @@ async function runComputation(walletPath: string): Promise<boolean> {
     const owner = readKp(walletPath);
     log("computation_start", { wallet: walletName, pub: owner.publicKey.toString() });
 
-    const conn = new anchor.web3.Connection(
-      process.env.RPC_URL || "https://api.devnet.solana.com",
-      "confirmed"
-    );
+    const conn = makeConnection();
     const wallet = new anchor.Wallet(owner);
     const provider = new anchor.AnchorProvider(conn, wallet, {
       commitment: "confirmed",
@@ -343,9 +375,7 @@ async function runPrivateVotingComputation(walletPath: string, clusterOffset: nu
   const walletName = path.basename(walletPath, ".json");
   try {
     const owner = readKp(walletPath);
-    const conn = new anchor.web3.Connection(
-      process.env.RPC_URL || "https://api.devnet.solana.com", "confirmed"
-    );
+    const conn = makeConnection();
     const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(owner), {
       commitment: "confirmed", skipPreflight: true,
     });
