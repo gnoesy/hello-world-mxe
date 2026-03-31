@@ -37,6 +37,64 @@ function log(event: string, data: Record<string, unknown> = {}) {
   console.log(entry);
 }
 
+async function withRpcRetry<T>(fn: () => Promise<T>, retries = 8): Promise<T> {
+  let delayMs = 500;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      const message = error?.message || String(error);
+      if (attempt >= retries || !message.includes("429")) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs *= 2;
+    }
+  }
+}
+
+async function sendAndConfirmCompat(
+  provider: anchor.AnchorProvider,
+  tx: anchor.web3.Transaction,
+  signers: anchor.web3.Signer[] = [],
+  opts: anchor.web3.ConfirmOptions = {},
+): Promise<string> {
+  const commitment = opts.commitment || opts.preflightCommitment || "confirmed";
+  const latest = await withRpcRetry(() =>
+    provider.connection.getLatestBlockhash({ commitment }),
+  );
+
+  tx.feePayer ||= provider.publicKey;
+  tx.recentBlockhash ||= latest.blockhash;
+  tx.lastValidBlockHeight ||= latest.lastValidBlockHeight;
+
+  if (signers.length > 0) {
+    tx.partialSign(...signers);
+  }
+
+  const signed = await provider.wallet.signTransaction(tx);
+  const sig = await withRpcRetry(() =>
+    provider.connection.sendRawTransaction(signed.serialize(), {
+      skipPreflight: opts.skipPreflight,
+      preflightCommitment: opts.preflightCommitment || commitment,
+      maxRetries: opts.maxRetries,
+    }),
+  );
+
+  await withRpcRetry(() =>
+    provider.connection.confirmTransaction(
+      {
+        signature: sig,
+        blockhash: tx.recentBlockhash,
+        lastValidBlockHeight: tx.lastValidBlockHeight!,
+      },
+      commitment,
+    ),
+  );
+
+  return sig;
+}
+
 function readKp(p: string): Keypair {
   return Keypair.fromSecretKey(
     new Uint8Array(JSON.parse(fs.readFileSync(p).toString()))
@@ -69,6 +127,11 @@ async function runMatchOrderComputation(walletPath: string, clusterOffset: numbe
     const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(owner), {
       commitment: "confirmed", skipPreflight: true,
     });
+    provider.sendAndConfirm = (
+      tx: anchor.web3.Transaction,
+      signers?: anchor.web3.Signer[],
+      opts?: anchor.web3.ConfirmOptions,
+    ) => sendAndConfirmCompat(provider, tx, signers || [], opts || {});
     anchor.setProvider(provider);
 
     const idl = JSON.parse(fs.readFileSync(ENCRYPTED_DEFI_IDL_PATH, "utf-8"));
@@ -162,6 +225,11 @@ async function runComputation(walletPath: string): Promise<boolean> {
       commitment: "confirmed",
       skipPreflight: true,
     });
+    provider.sendAndConfirm = (
+      tx: anchor.web3.Transaction,
+      signers?: anchor.web3.Signer[],
+      opts?: anchor.web3.ConfirmOptions,
+    ) => sendAndConfirmCompat(provider, tx, signers || [], opts || {});
     anchor.setProvider(provider);
 
     const idl = JSON.parse(
@@ -281,6 +349,11 @@ async function runPrivateVotingComputation(walletPath: string, clusterOffset: nu
     const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(owner), {
       commitment: "confirmed", skipPreflight: true,
     });
+    provider.sendAndConfirm = (
+      tx: anchor.web3.Transaction,
+      signers?: anchor.web3.Signer[],
+      opts?: anchor.web3.ConfirmOptions,
+    ) => sendAndConfirmCompat(provider, tx, signers || [], opts || {});
     anchor.setProvider(provider);
 
     const idl = JSON.parse(fs.readFileSync(PRIVATE_VOTING_IDL_PATH, "utf-8"));
